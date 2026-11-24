@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.jsonl_artifact import read_artifact
 from app.store import store
 
 
@@ -52,22 +53,32 @@ class ChecksumVerifyService(BaseModuleService):
         if verify_entry is None:
             return {"error": f"校验任务 {verify_id} 不存在"}
 
+        batch_code = verify_entry["批次编号"]
+
+        # 门控前置：未完整提交的批次不参与核对，状态不流转、不写结论日志
+        batch_artifact = read_artifact("batches", batch_code)
+        if batch_artifact.state == "partial":
+            return {"verify_code": verify_entry["校验编号"], "batch_code": batch_code,
+                    "complete": False,
+                    "error": "批次产物尚未完成提交确认，校验核对等待完整批次信号",
+                    "records_on_disk": len(batch_artifact.records)}
+
         entry, msg = self.run_action(verify_id, "启动校验")
         if entry is None:
             return {"error": msg, "verify_id": verify_id}
 
-        batch_code = verify_entry["批次编号"]
-
-        # 读取传输批次产物文件（源端数据）
-        batch_file = self._data_dir("batches") / f"{batch_code}.jsonl"
-        batch_records = self._read_jsonl(batch_file)
+        # 缺文件/空文件沿用旧行为：读到空记录列表，校验值基于空列表计算
+        batch_records = batch_artifact.records
 
         # 从暂存产品目录查找对应落地产物文件（目标端数据）
         staging_dir = self._data_dir("staging")
         staging_records = []
-        for staging_file in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            staging_records = self._read_jsonl(staging_file)
-            break
+        staging_prefix = f"STAG-{batch_code}-"
+        staging_matches = sorted(
+            p for p in staging_dir.glob("STAG-*.jsonl") if p.name.startswith(staging_prefix)
+        )
+        if staging_matches:
+            staging_records = self._read_jsonl(staging_matches[0])
 
         # 计算源端与目标端校验值
         source_checksum = self._compute_checksum(str(batch_records))

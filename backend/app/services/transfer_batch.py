@@ -2,14 +2,23 @@
 
 本模块读取抽取窗口产物文件后创建传输批次，分片写入传输数据文件，
 传输完成后自动驱动暂存落地和校验核对，形成窗口抽取→批次传输→落地校验的贯通链路。
+
+JSONL 产物的读取、分片写入与提交确认统一走
+:mod:`app.services.jsonl_artifact` 的共用约定；本服务只保留批次交付数据
+组装、调用返回结构和传输侧自身的提交语义。
 """
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from app.services.base import BaseModuleService
-from app.store import store
+from app.services.jsonl_artifact import (
+    ArtifactWriteInterrupted,
+    read_artifact,
+    write_artifact,
+)
 
 
 class TransferBatchService(BaseModuleService):
@@ -52,6 +61,12 @@ class TransferBatchService(BaseModuleService):
 
         本方法执行实际的批量数据传输：从抽取产物文件读取数据，切分为分片，
         写入传输产物文件（jsonl），计算字节总量，然后自动触发暂存落地和校验核对。
+
+        恢复约定（同一批次可重复进入本方法）：
+        - 上游产物缺文件：沿用旧兜底生成模拟数据；存在但空文件：读到零条；
+        - 传输产物已提交：幂等复用，不再重复触发下游；
+        - 传输产物 partial（如首片落盘后后端写入中断）：只追加缺失分片，
+          完成本侧数据确认与提交后才放行下游。
         """
         batch_entry = self.get_entry(batch_id)
         if batch_entry is None:
@@ -64,37 +79,47 @@ class TransferBatchService(BaseModuleService):
         batch_code = batch_entry["批次编号"]
         window_code = batch_entry.get("窗口编号", "unknown")
 
-        # 读取上游抽取窗口的产物文件
-        artifact_dir = self._data_dir("extracted")
-        source_file = artifact_dir / f"{window_code}.jsonl" if window_code != "unknown" else None
+        # 读取上游抽取窗口的产物文件（共用读取约定，区分缺文件/空文件）
+        source_state = "missing"
+        records: list[dict[str, Any]] = []
+        if window_code != "unknown":
+            source = read_artifact("extracted", window_code)
+            source_state = source.state
+            if source.exists:
+                # 存在（含空文件）：以产物为准，保留空文件读到零条的旧行为
+                records = [dict(r) for r in source.records]
+        if source_state == "missing":
+            # 缺文件：沿用旧兜底生成模拟数据
+            records = self._simulate_records(
+                batch_code, count=int(batch_entry.get("记录条数", 10)), field_prefix="trans"
+            )
 
-        records = []
-        if source_file and source_file.exists():
-            records = self._read_jsonl(source_file)
-        else:
-            # 如果上游产物文件不存在，生成模拟数据
-            records = self._simulate_records(batch_code, count=int(batch_entry.get("记录条数", 10)),
-                                              field_prefix="trans")
+        # 保留原批次交付数据字段：批次编号、分片序号、传输时间戳
+        chunk_index = 0
+        for i, rec in enumerate(records):
+            if i > 0 and i % chunk_size == 0:
+                chunk_index += 1
+            rec["batch_code"] = batch_code
+            rec["chunk_index"] = chunk_index
+            rec["transferred_at"] = time.time()
 
-        # 分片写入传输产物文件
         output_file = self._data_dir("batches") / f"{batch_code}.jsonl"
-        total_bytes = 0
-        total_written = 0
-        chunks = []
-        for i in range(0, len(records), chunk_size):
-            chunk = records[i:i + chunk_size]
-            for rec in chunk:
-                rec["batch_code"] = batch_code
-                rec["chunk_index"] = i // chunk_size
-                rec["transferred_at"] = time.time()
-            self._write_jsonl(output_file, chunk)
-            chunk_bytes = sum(len(str(r).encode("utf-8")) for r in chunk)
-            chunks.append({"chunk_index": i // chunk_size, "record_count": len(chunk),
-                           "bytes": chunk_bytes})
-            total_bytes += chunk_bytes
-            total_written += len(chunk)
 
-        # 更新批次水位和字节总量
+        # 分片写入 + 本侧数据确认 + 提交清单；中断时直接向上抛出，
+        # 不更新水位、不写断点、不触发任何下游。
+        write_result = write_artifact(
+            output_file,
+            records,
+            shard_size=chunk_size,
+            allow_empty_file=False,  # 传输侧旧行为：零条数据不建产物文件
+            extra_manifest={"batch_code": batch_code, "window_code": window_code},
+        )
+
+        total_written = write_result["record_count"]
+        total_bytes = write_result["total_bytes"]
+        shard_count = write_result["manifest"]["shard_count"] if write_result["manifest"] else 0
+
+        # 更新批次水位和字节总量（与旧落盘值一致）
         entry["字节总量"] = str(total_bytes)
         entry["记录条数"] = str(total_written)
         entry["批次水位"] = str(total_written)
@@ -105,27 +130,57 @@ class TransferBatchService(BaseModuleService):
             "window_code": window_code,
             "records_transferred": total_written,
             "total_bytes": total_bytes,
-            "chunk_count": len(chunks),
+            "chunk_count": shard_count,
             "watermark": str(total_written),
             "last_transfer_at": time.time(),
         })
 
-        result = {
+        result: dict[str, Any] = {
             "batch_code": batch_code,
             "window_code": window_code,
             "records_transferred": total_written,
             "total_bytes": total_bytes,
-            "chunks": len(chunks),
+            "chunks": shard_count,
             "artifact_path": str(output_file),
         }
+        if write_result["resumed"]:
+            result["resumed_from"] = {
+                "records_on_disk": total_written - write_result["records_written"],
+                "shards_flushed_this_run": write_result["shards_flushed"],
+            }
+        if write_result["reused"]:
+            # 已完整提交的批次再次执行：幂等返回，下游不重复触发
+            result["already_committed"] = True
+            result["auto_staging"] = {"skipped": "batch_already_committed"}
+            result["auto_verify"] = {"skipped": "batch_already_committed"}
+            result["auto_reconcile"] = {"skipped": "batch_already_committed"}
+            return result
 
+        # 本侧完成数据确认并提交后，才允许下游继续
         # 传输完成后自动触发暂存落地
         try:
             sa_svc = self._safe_import("app.services.staging_area", "StagingAreaService")()
             staging_result = sa_svc.land_batch(batch_code, total_written)
             result["auto_staging"] = staging_result
+        except ArtifactWriteInterrupted as e:
+            # 暂存侧写入中断：只在它自己完成确认后才应继续，此处不放行后续环节
+            result["auto_staging"] = {"error": str(e), "interrupted": True,
+                                      "flushed_records": e.flushed_records}
+            result["auto_verify"] = {"skipped": "staging_not_committed"}
+            result["auto_reconcile"] = {"skipped": "staging_not_committed"}
+            return result
         except Exception as e:
             result["auto_staging"] = {"error": str(e)}
+            result["auto_verify"] = {"skipped": "staging_not_committed"}
+            result["auto_reconcile"] = {"skipped": "staging_not_committed"}
+            return result
+
+        # 暂存落地未完整提交时，下游校验/对账不得继续
+        staging_commit = read_artifact("staging", Path(result["auto_staging"]["artifact_path"]).stem)
+        if not staging_commit.committed:
+            result["auto_verify"] = {"skipped": "staging_not_committed"}
+            result["auto_reconcile"] = {"skipped": "staging_not_committed"}
+            return result
 
         # 传输完成后自动创建校验核对任务
         try:
@@ -146,13 +201,25 @@ class TransferBatchService(BaseModuleService):
         return result
 
     def mark_completed(self, batch_id: int) -> dict[str, Any]:
-        """标记传输批次已完成，写入完成事件日志并记录批次汇总统计。"""
+        """标记传输批次已完成，写入完成事件日志并记录批次汇总统计。
+
+        批次产物未完整提交（partial，例如写入中断）时拒绝完成确认，
+        状态不流转、不写完成日志；缺文件/空文件沿用旧行为（读到零条）。
+        """
+        batch_entry = self.get_entry(batch_id)
+        if batch_entry is None:
+            return {"error": f"传输批次 {batch_id} 不存在或已归档"}
+        batch_code = batch_entry["批次编号"]
+        artifact_file = self._data_dir("batches") / f"{batch_code}.jsonl"
+        artifact = read_artifact("batches", batch_code)
+        if artifact.state == "partial":
+            return {"error": "批次产物尚未完成提交确认，不能标记完成", "batch_code": batch_code,
+                    "records_on_disk": len(artifact.records), "complete": False}
+
         entry, msg = self.run_action(batch_id, "标记完成")
         if entry is None:
             return {"error": msg, "batch_id": batch_id}
-        batch_code = entry["批次编号"]
-        # 从产物文件验证批次完整性
-        artifact_file = self._data_dir("batches") / f"{batch_code}.jsonl"
+        # 从产物文件验证批次完整性（缺文件/空文件旧行为：空记录、空校验）
         records = self._read_jsonl(artifact_file)
         checksum = self._compute_checksum(str(records))
         self._write_jsonl(

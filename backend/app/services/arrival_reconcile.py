@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.jsonl_artifact import read_artifact
 from app.store import store
 
 
@@ -51,29 +52,39 @@ class ArrivalReconcileService(BaseModuleService):
         if recon_entry is None:
             return {"error": f"对账单 {recon_id} 不存在"}
 
+        batch_code = recon_entry["批次编号"]
+        expected = int(recon_entry.get("应到条数", 0))
+
+        # 门控前置：未完整提交的批次不参与对账，状态不流转、不写结论日志
+        batch_artifact = read_artifact("batches", batch_code)
+        if batch_artifact.state == "partial":
+            return {"recon_code": recon_entry["对账编号"], "batch_code": batch_code,
+                    "complete": False,
+                    "error": "批次产物尚未完成提交确认，到达对账等待完整批次信号",
+                    "records_on_disk": len(batch_artifact.records)}
+
         entry, msg = self.run_action(recon_id, "启动对账")
         if entry is None:
             return {"error": msg, "recon_id": recon_id}
 
-        batch_code = recon_entry["批次编号"]
-        expected = int(recon_entry.get("应到条数", 0))
-
-        # 从传输批次产物文件读取源数据
-        batch_file = self._data_dir("batches") / f"{batch_code}.jsonl"
-        batch_records = self._read_jsonl(batch_file)
+        # 缺文件/空文件沿用旧行为：读到空记录，应到/实到差异按旧公式计算
+        batch_records = batch_artifact.records
         source_count = len(batch_records)
 
         # 从暂存产品目录查找目标落地产物文件
         staging_dir = self._data_dir("staging")
         staging_count = 0
         late_count = 0
-        for sf in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            s_records = self._read_jsonl(sf)
+        staging_prefix = f"STAG-{batch_code}-"
+        staging_matches = sorted(
+            p for p in staging_dir.glob("STAG-*.jsonl") if p.name.startswith(staging_prefix)
+        )
+        if staging_matches:
+            s_records = self._read_jsonl(staging_matches[0])
             staging_count = len(s_records)
             # 计算迟到条数：目标端实际记录数少于源端基准
             if staging_count < expected:
                 late_count = expected - staging_count
-            break
 
         missing_count = max(0, expected - staging_count)
         is_balanced = expected == staging_count
